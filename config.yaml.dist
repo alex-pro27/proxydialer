@@ -1,0 +1,14 @@
+version: '3.7'
+
+dialer:
+  server: 127.0.0.1
+  port: 7492
+
+proxies:
+  - 
+    protocol: socks5
+    server: 127.0.0.1
+    username: developer
+    password: 'qwerty12345'
+    port: 9090
+    use: true
