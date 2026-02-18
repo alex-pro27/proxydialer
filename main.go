@@ -120,11 +120,6 @@ func getDialContext(dialer proxy.Dialer) DialContext {
 // getHandleTunneling handles CONNECT requests
 func getHandleTunneling(dialer proxy.Dialer) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		//dest_conn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
-		//if err != nil {
-		//	http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		//	return
-		//}
 		dest_conn, err := dialer.Dial("tcp", r.Host)
 
 		if err != nil {
@@ -132,30 +127,48 @@ func getHandleTunneling(dialer proxy.Dialer) func(w http.ResponseWriter, r *http
 			return
 		}
 
-		w.WriteHeader(http.StatusOK)
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
+			dest_conn.Close()
 			http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 			return
 		}
-		client_conn, _, err := hijacker.Hijack()
+		client_conn, bufRW, err := hijacker.Hijack()
 		if err != nil {
+			dest_conn.Close()
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
 		}
-		go transfer(dest_conn, client_conn)
+
+		_, err = bufRW.WriteString("HTTP/1.1 200 Connection established\r\n\r\n")
+		if err != nil {
+			dest_conn.Close()
+			client_conn.Close()
+			return
+		}
+		bufRW.Flush()
+
+		clientReader := struct {
+			io.Reader
+			io.Closer
+		}{bufRW.Reader, client_conn}
+
+		go transfer(dest_conn, clientReader)
 		go transfer(client_conn, dest_conn)
 	}
 }
 
 func transfer(destination io.WriteCloser, source io.ReadCloser) {
+	defer func() {
+		if destination != nil {
+			destination.Close()
+		}
+		if source != nil {
+			source.Close()
+		}
+	}()
 	if destination != nil && source != nil {
 		io.Copy(destination, source)
-	}
-	if destination != nil {
-		destination.Close()
-	}
-	if source != nil {
-		source.Close()
 	}
 }
 
