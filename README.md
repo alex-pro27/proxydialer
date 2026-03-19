@@ -1,67 +1,98 @@
 # ProxyDialer
 
-ProxyDialer is a CLI application written in Go designed to relay HTTP requests through a SOCKS5 proxy. It supports dynamic configuration reloading without needing to restart the application, based on changes to a YAML configuration file.
+HTTP-прокси, который перенаправляет трафик через удалённый SOCKS5-прокси. Поддерживает несколько независимых слушателей, гибкую фильтрацию доменов и горячую перезагрузку конфигурации.
 
-## Features
+## Возможности
 
-- **SOCKS5 Proxy Support**: Currently, only SOCKS5 proxies are supported for relaying traffic.
-- **Dynamic Configuration**: Automatically reload configuration when the configuration file is modified.
-- **Logging**: Logs HTTP requests and configuration changes.
+- **Несколько слушателей** — каждый с отдельным SOCKS5-прокси и правилами фильтрации
+- **Фильтрация доменов** — правила `only` и `exclude` с поддержкой wildcard-паттернов (`*.example.com`)
+- **Горячая перезагрузка** — конфигурация перечитывается при изменении файла или сигнале `SIGHUP`, без перезапуска
+- **Аутентификация** — поддержка логина/пароля для SOCKS5
 
-## Installation
+## Установка
 
-To install and run ProxyDialer, follow these steps:
+```bash
+git clone https://github.com/alex-pro27/proxydialer.git
+cd proxydialer
+go build -o proxydialer main.go
+```
 
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/alex-pro27/proxydialer.git
-   cd proxydialer
-   ```
-
-2. **Build the Application**:
-   Ensure you have Go installed on your machine. If not, download and install it from the [official website](https://golang.org/dl/).
-
-   Run the following command to build the application:
-   ```bash
-   go build -o proxydialer
-   ```
-
-3. **Create Configuration File**:
-   Create a `config.yaml` file in the same directory as the built executable. Here is an example configuration:
-
-   ```yaml
-   version: "1.0"
-   dialer:
-     server: "localhost"
-     port: 8080
-   proxies:
-     - protocol: "socks5"
-       server: "socks5-server"
-       port: 1080
-       username: "your-username"
-       password: "your-password"
-       use: true
-   ```
-
-## Usage
-
-Run the application by executing the following command in your terminal:
+## Запуск
 
 ```bash
 ./proxydialer
 ```
 
-By default, ProxyDialer will look for a configuration file named `config.yaml` in the current directory. You can override this by specifying the `PROXY_DEALER_CONFIG_FILE` environment variable to the desired configuration file path.
+По умолчанию ищет `config.yaml` в текущей директории. Путь можно переопределить переменной окружения:
 
-## Configuration Details
+```bash
+PROXY_DEALER_CONFIG_FILE=/etc/proxydialer/config.yaml ./proxydialer
+```
 
-- **version**: The configuration file version.
-- **dialer**: Defines the local server settings.
-  - `server`: Local server address (e.g., "localhost").
-  - `port`: Port where the server will listen for requests.
-- **proxies**: A list of proxy server configurations.
-  - `protocol`: Protocol type (Only "socks5" is supported).
-  - `server`: Proxy server address.
-  - `port`: Proxy server port.
-  - `username`, `password`: Credentials for proxy authentication.
-  - `use`: Boolean indicating whether this proxy should be used.
+## Конфигурация
+
+Файл `config.yaml`:
+
+```yaml
+proxies:
+  # Прокси без фильтрации — весь трафик идёт через него
+  - dialer: 127.0.0.1:7492       # локальный адрес слушателя
+    proxy: 192.168.50.51:1818    # адрес удалённого SOCKS5
+    protocol: socks5
+    username: user               # опционально
+    password: passwd             # опционально
+    use: true
+
+  # Прокси с фильтрацией — только перечисленные домены идут через прокси
+  - dialer: 127.0.0.1:7493
+    proxy: 192.168.50.52:1818
+    protocol: socks5
+    use: true
+    only:
+      - '*.github.com'
+      - '*.openai.com'
+      - 'example.com'
+
+  # Прокси с исключениями — все домены кроме перечисленных
+  - dialer: 127.0.0.1:7494
+    proxy: 192.168.50.53:1818
+    protocol: socks5
+    use: true
+    exclude:
+      - 'localhost'
+      - '*.internal.corp'
+```
+
+### Поля
+
+| Поле | Обязательное | Описание |
+|------|:---:|---------|
+| `dialer` | ✓ | Локальный адрес `host:port`, на котором слушает HTTP-прокси |
+| `proxy` | ✓ | Адрес удалённого SOCKS5 `host:port` |
+| `protocol` | ✓ | Протокол прокси (поддерживается только `socks5`) |
+| `username` | — | Логин для SOCKS5-аутентификации |
+| `password` | — | Пароль для SOCKS5-аутентификации |
+| `use` | ✓ | `true` — слушатель активен, `false` — пропускается |
+| `only` | — | Список доменов, которые идут через прокси; остальное — напрямую |
+| `exclude` | — | Список доменов, которые идут напрямую; остальное — через прокси |
+
+Если заданы одновременно `only` и `exclude`, домен должен входить в `only` и **не** входить в `exclude`.
+
+### Wildcard-паттерны
+
+В `only` и `exclude` поддерживаются паттерны вида `*.example.com`:
+
+| Паттерн | Совпадает с |
+|---------|------------|
+| `example.com` | `example.com`, `api.example.com`, `foo.bar.example.com` |
+| `*.example.com` | `example.com`, `api.example.com`, `foo.bar.example.com` |
+
+> `*.example.com` покрывает и сам apex-домен, и все поддомены.
+
+## Горячая перезагрузка
+
+ProxyDialer отслеживает изменения файла конфигурации и автоматически перезапускает затронутые слушатели. Также можно принудительно перезагрузить конфигурацию сигналом:
+
+```bash
+kill -HUP <pid>
+```

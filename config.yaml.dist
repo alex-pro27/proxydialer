@@ -1,14 +1,45 @@
-version: '3.7'
-
-dialer:
-  server: 127.0.0.1
-  port: 7492
-
 proxies:
-  - 
+  -
+    dialer: 127.0.0.1:7492
+    proxy: 127.0.0.1:6066
     protocol: socks5
-    server: 127.0.0.1
-    username: developer
-    password: 'qwerty12345'
-    port: 9090
+    username: user
+    password: passwd
     use: true
+  -
+    dialer: 127.0.0.1:7493
+    proxy: 127.0.0.1:6066
+    protocol: socks5
+    use: true
+    only:
+      - '*.microsoft.com'
+      - '*.github.com'
+      - '*.openai.com'
+      - '*.anthropic.com'
+      - '*.speedtest.net'
+      - '*.visualstudio.com'
+      - '*.vscode.dev'
+      - '*.githubusercontent.com'
+      - '*.visual-studio.com'
+      - '*.chatgpt.com'
+      - 'gemini.google.com'
+      - '*.youtube.com'
+      - '*.youtu.be'
+      - '*.googlevideo.com'
+      - 'yt.be'
+      - 'ytimg.com'
+      - 'ggpht.com'
+      - 'gvt1.com'
+      - 'youtube-nocookie.com'
+      - 'youtube-ui.l.google.com'
+      - 'youtubeembeddedplayer.googleapis.com'
+      - 'yt3.googleusercontent.com'
+      - 'youtube.googleapis.com'
+      - 'youtubei.googleapis.com'
+      - 'yt-video-upload.l.google.com'
+      - 'wide-youtube.l.google.com'
+      - 'youtubei.googleapis.com'
+      - 'aistudio.google.com'
+      - '*.doubleclick.net'
+      - 'console.cloud.google.com'
+      - '*.claude.ai'
