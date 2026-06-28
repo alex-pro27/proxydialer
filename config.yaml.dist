@@ -1,13 +1,47 @@
+routes:
+  -
+    proxy: 127.0.0.1:58580
+    use: true
+    exclude:
+      - "*.microsoft.com"
+    auth:
+      username: "route_user"
+      password: "route_pass"
+    rules:
+      "SPB":
+        priority: 1
+      "US (Microsoft, GitHub, OpenAI)":
+        priority: 2
 proxies:
+  # standalone-прокси — слушает напрямую
   -
     dialer: 127.0.0.1:7492
-    proxy: 127.0.0.1:6066
+    proxy: 127.0.0.1:6969
     protocol: socks5
-    username: user
-    password: passwd
+    username: user         # плоский формат аутентификации (старый)
+    password: pass
     use: true
+    exclude:
+      - '*.yandex.ru'
+  # routing-only прокси — без dialer, используется только через routes
   -
-    dialer: 127.0.0.1:7493
+    name: SPB
+    proxy: 127.0.0.1:6969
+    protocol: socks5
+    use: true
+    auth:                  # вложенный формат аутентификации (новый)
+      username: "user"
+      password: "pass"
+    exclude:
+      - '*.cloud-effem.ru'
+      - '*.gosuslugi.ru'
+      - '10.248.1.79'
+      - '*.dzen.ru'
+      - '*.yandex.ru'
+      - '*.vk.com'
+      - '*.mail.ru'
+  -
+    name: US (Microsoft, GitHub, OpenAI)
     proxy: 127.0.0.1:6066
     protocol: socks5
     use: true

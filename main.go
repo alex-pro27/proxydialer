@@ -1,10 +1,9 @@
-//go:build ignore
-
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,28 +32,100 @@ const (
 
 const defaultConfigFileName = "config.yaml"
 
+// AuthConfig описывает вложенную секцию авторизации.
+type AuthConfig struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+}
+
 // ProxyEntry описывает одну запись прокси в конфиге.
 type ProxyEntry struct {
-	Dialer   string   `yaml:"dialer"`   // локальный адрес слушателя, например 127.0.0.1:7492
-	Proxy    string   `yaml:"proxy"`    // адрес удалённого прокси, например 85.193.81.230:1818
-	Protocol Protocol `yaml:"protocol"` // только "socks5"
-	Username string   `yaml:"username"`
-	Password string   `yaml:"password"`
-	Use      bool     `yaml:"use"`
-	Exclude  []string `yaml:"exclude"` // домены, которые обходят прокси напрямую
-	Only     []string `yaml:"only"`    // домены, которые идут ТОЛЬКО через прокси; всё остальное — напрямую
+	Dialer   string     `yaml:"dialer"`           // локальный адрес слушателя, например 127.0.0.1:7492
+	Proxy    string     `yaml:"proxy"`            // адрес удалённого прокси, например 85.193.81.230:1818
+	Protocol Protocol   `yaml:"protocol"`         // только "socks5"
+	Username string     `yaml:"username,omitempty"` // плоский формат (старый)
+	Password string     `yaml:"password,omitempty"` // плоский формат (старый)
+	Auth     *AuthConfig `yaml:"auth,omitempty"`    // вложенный формат (новый)
+	Use      bool       `yaml:"use"`              // включить/выключить
+	Exclude  []string   `yaml:"exclude"`          // домены, которые обходят прокси напрямую
+	Only     []string   `yaml:"only"`             // домены, которые идут ТОЛЬКО через прокси; всё остальное — напрямую
+	Name     string     `yaml:"name,omitempty"`   // имя прокси для ссылок из routes
+}
+
+func (e ProxyEntry) GetUsername() string {
+	if e.Auth != nil && e.Auth.Username != "" {
+		return e.Auth.Username
+	}
+	return e.Username
+}
+
+func (e ProxyEntry) GetPassword() string {
+	if e.Auth != nil && e.Auth.Password != "" {
+		return e.Auth.Password
+	}
+	return e.Password
 }
 
 // configHash возвращает строку-отпечаток конфигурации для обнаружения изменений.
 func (e *ProxyEntry) configHash() string {
-	return fmt.Sprintf("%s|%s|%s|%s|%s|%v|%v|%v",
-		e.Dialer, e.Proxy, e.Protocol, e.Username, e.Password, e.Use, e.Exclude, e.Only)
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%v|%v|%v|%s",
+		e.Dialer, e.Proxy, e.Protocol, e.GetUsername(), e.GetPassword(), e.Use, e.Exclude, e.Only, e.Name)
+}
+
+// RouteRule задаёт приоритет именованного прокси в правилах маршрутизации.
+type RouteRule struct {
+	Priority int `yaml:"priority"`
+	Pririty  int `yaml:"pririty"` // поддержка опечатки в конфиге
+}
+
+func (r RouteRule) GetPriority() int {
+	if r.Priority != 0 {
+		return r.Priority
+	}
+	return r.Pririty
+}
+
+// RouteEntry описывает маршрут — слушатель, который объединяет несколько прокси по приоритетам.
+type RouteEntry struct {
+	Dialer  string               `yaml:"proxy"`        // адрес слушателя маршрута
+	Use     bool                 `yaml:"use"`           // включить/выключить
+	Exclude []string             `yaml:"exclude"`       // домены-исключения на уровне маршрута
+	Only    []string             `yaml:"only"`          // домены, идущие только через маршрут
+	Auth    *AuthConfig          `yaml:"auth,omitempty"` // опциональная HTTP-авторизация на слушателе
+	Rules   map[string]RouteRule `yaml:"rules"`         // имя прокси → приоритет
+}
+
+// configHash возвращает строку-отпечаток маршрута для обнаружения изменений.
+func (r *RouteEntry) configHash() string {
+	names := make([]string, 0, len(r.Rules))
+	for name := range r.Rules {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var rulesParts []string
+	for _, name := range names {
+		rule := r.Rules[name]
+		rulesParts = append(rulesParts, fmt.Sprintf("%s:%d", name, rule.GetPriority()))
+	}
+	authPart := ""
+	if r.Auth != nil {
+		authPart = fmt.Sprintf("%s:%s", r.Auth.Username, r.Auth.Password)
+	}
+	return fmt.Sprintf("%s|%v|%v|%v|%s|%s",
+		r.Dialer, r.Use, r.Exclude, r.Only, authPart, strings.Join(rulesParts, ","))
 }
 
 // Config — корневой тип конфигурационного файла.
 type Config struct {
 	Version string       `yaml:"version"`
+	Routes  []RouteEntry `yaml:"routes"`
 	Proxies []ProxyEntry `yaml:"proxies"`
+}
+
+// NamedProxy связывает запись прокси с собранным dialer-ом для использования в маршрутах.
+type NamedProxy struct {
+	Entry  ProxyEntry
+	Dialer proxy.Dialer
 }
 
 // matchDomain проверяет, совпадает ли host с доменом.
@@ -66,7 +138,6 @@ func matchDomain(host, domain string) bool {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 
 	if strings.HasPrefix(domain, "*.") {
-		// *.openai.com совпадает с любым поддоменом и с самим openai.com
 		suffix := domain[1:] // ".openai.com"
 		base := domain[2:]   // "openai.com"
 		return host == base || strings.HasSuffix(host, suffix)
@@ -120,21 +191,30 @@ func getConfigFile() string {
 	return filepath.Join(cwd, defaultConfigFileName)
 }
 
-func parseConfig(configFile string) Config {
+func parseConfig(configFile string) (Config, error) {
 	data, err := os.ReadFile(configFile)
 	if err != nil {
-		panic(fmt.Sprintf("cannot read config: %v", err))
+		return Config{}, fmt.Errorf("cannot read config: %w", err)
 	}
 	var conf Config
 	if err := yaml.Unmarshal(data, &conf); err != nil {
-		panic(fmt.Sprintf("cannot parse config: %v", err))
+		return Config{}, fmt.Errorf("cannot parse config: %w", err)
 	}
-	return conf
+	return conf, nil
 }
 
-func getActiveProxies(configFile string) []ProxyEntry {
-	conf := parseConfig(configFile)
-	var active []ProxyEntry
+// ActiveConfig содержит активные прокси и маршруты после фильтрации.
+type ActiveConfig struct {
+	Proxies []ProxyEntry
+	Routes  []RouteEntry
+}
+
+func getActiveConfig(configFile string) (ActiveConfig, error) {
+	conf, err := parseConfig(configFile)
+	if err != nil {
+		return ActiveConfig{}, err
+	}
+	var proxies []ProxyEntry
 	for _, p := range conf.Proxies {
 		if !p.Use {
 			continue
@@ -143,9 +223,16 @@ func getActiveProxies(configFile string) []ProxyEntry {
 			log.Printf("skip proxy %s: protocol %q not supported (only socks5)", p.Proxy, p.Protocol)
 			continue
 		}
-		active = append(active, p)
+		proxies = append(proxies, p)
 	}
-	return active
+	var routes []RouteEntry
+	for _, r := range conf.Routes {
+		if !r.Use {
+			continue
+		}
+		routes = append(routes, r)
+	}
+	return ActiveConfig{Proxies: proxies, Routes: routes}, nil
 }
 
 // transfer копирует данные между двумя соединениями и закрывает оба.
@@ -178,6 +265,107 @@ func dialerFor(host string, proxyD proxy.Dialer, entry ProxyEntry) (proxy.Dialer
 	} else {
 		return proxy.Direct, reason
 	}
+}
+
+// routeRequest выбирает прокси для домена согласно приоритетам маршрута.
+// Алгоритм:
+//  1. Пре-фильтр маршрута (собственные Only/Exclude)
+//  2. Поиск only-совпадений среди прокси: домен в Only прокси → приоритет only-совпадений выше
+//  3. Если only-совпадений нет — fallback на прокси, которые не исключают домен
+//  4. Ни один прокси не совпал → Direct
+func routeRequest(host string, route RouteEntry, proxies map[string]NamedProxy) (proxy.Dialer, string) {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	// 1. Пре-фильтр маршрута
+	routeFilter := ProxyEntry{Exclude: route.Exclude, Only: route.Only}
+	if use, reason := shouldUseProxy(host, routeFilter); !use {
+		return proxy.Direct, "route-" + reason
+	}
+
+	// 2. Сортировка правил по приоритету (меньше число = выше приоритет)
+	type ruleKV struct {
+		name     string
+		priority int
+	}
+	var sorted []ruleKV
+	for name, rule := range route.Rules {
+		sorted = append(sorted, ruleKV{name: name, priority: rule.GetPriority()})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].priority < sorted[j].priority
+	})
+
+	// 3. Сбор совпадений: only-совпадения отдельно, exclude/default отдельно
+	type match struct {
+		name     string
+		priority int
+		reason   string
+	}
+	var onlyMatches []match
+	var defaultMatches []match
+
+	for _, rkv := range sorted {
+		np, ok := proxies[rkv.name]
+		if !ok {
+			continue
+		}
+		use, reason := shouldUseProxy(host, np.Entry)
+		if !use {
+			continue
+		}
+		if strings.HasPrefix(reason, "only:") {
+			onlyMatches = append(onlyMatches, match{name: rkv.name, priority: rkv.priority, reason: reason})
+		} else {
+			defaultMatches = append(defaultMatches, match{name: rkv.name, priority: rkv.priority, reason: reason})
+		}
+	}
+
+	// 4. Only-совпадения приоритетнее exclude/default
+	if len(onlyMatches) > 0 {
+		winner := onlyMatches[0] // уже отсортированы по приоритету
+		return proxies[winner.name].Dialer, "route-only:" + winner.name + "(" + winner.reason + ")"
+	}
+
+	// 5. Fallback на exclude/default
+	if len(defaultMatches) > 0 {
+		winner := defaultMatches[0]
+		return proxies[winner.name].Dialer, "route-default:" + winner.name + "(" + winner.reason + ")"
+	}
+
+	// 6. Ничего не совпало
+	return proxy.Direct, "route-no-match"
+}
+
+// parseBasicAuth разбирает заголовок формата "Basic <base64>"
+func parseBasicAuth(auth string) (username, password string, ok bool) {
+	const prefix = "Basic "
+	if !strings.HasPrefix(auth, prefix) {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		return "", "", false
+	}
+	s := string(decoded)
+	colon := strings.IndexByte(s, ':')
+	if colon < 0 {
+		return "", "", false
+	}
+	return s[:colon], s[colon+1:], true
+}
+
+// checkRouteAuth проверяет HTTP Proxy-Authorization заголовок запроса.
+func checkRouteAuth(r *http.Request, auth *AuthConfig) bool {
+	if auth == nil || (auth.Username == "" && auth.Password == "") {
+		return true
+	}
+	username, password, ok := parseBasicAuth(r.Header.Get("Proxy-Authorization"))
+	if !ok {
+		return false
+	}
+	return username == auth.Username && password == auth.Password
 }
 
 func dialContextFrom(d proxy.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -245,8 +433,10 @@ func handleHTTP(w http.ResponseWriter, req *http.Request, d proxy.Dialer) {
 
 func buildDialer(entry ProxyEntry) (proxy.Dialer, error) {
 	var auth *proxy.Auth
-	if entry.Username != "" || entry.Password != "" {
-		auth = &proxy.Auth{User: entry.Username, Password: entry.Password}
+	username := entry.GetUsername()
+	password := entry.GetPassword()
+	if username != "" || password != "" {
+		auth = &proxy.Auth{User: username, Password: password}
 	}
 	return proxy.SOCKS5("tcp", entry.Proxy, auth, proxy.Direct)
 }
@@ -295,21 +485,102 @@ func runServer(entry ProxyEntry, stop <-chan struct{}, wg *sync.WaitGroup) {
 	server.ListenAndServe()
 }
 
-// serverGroup управляет группой запущенных серверов.
-type serverGroup struct {
-	entries []ProxyEntry
-	stops   []chan struct{}
-	wg      sync.WaitGroup
+func runRouteServer(route RouteEntry, proxyMap map[string]NamedProxy, stop <-chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	server := &http.Server{
+		Addr: route.Dialer,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Проверка HTTP Proxy Auth
+			if !checkRouteAuth(r, route.Auth) {
+				w.Header().Set("Proxy-Authenticate", "Basic realm=\"proxy\"")
+				http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+				return
+			}
+
+			d, reason := routeRequest(r.Host, route, proxyMap)
+			via := "proxy"
+			if d == proxy.Direct {
+				via = "direct"
+			}
+			log.Printf("[route:%s] %s %s %s → %s (%s)", route.Dialer, r.RemoteAddr, r.Method, r.Host, via, reason)
+
+			if r.Method == http.MethodConnect {
+				handleTunneling(w, r, d)
+			} else {
+				handleHTTP(w, r, d)
+			}
+		}),
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+	}
+
+	go func() {
+		<-stop
+		server.Shutdown(context.Background())
+	}()
+
+	log.Printf("[route:%s] listening", route.Dialer)
+	if len(route.Only) > 0 {
+		log.Printf("[route:%s] only:    %v", route.Dialer, route.Only)
+	}
+	if len(route.Exclude) > 0 {
+		log.Printf("[route:%s] exclude: %v", route.Dialer, route.Exclude)
+	}
+	if route.Auth != nil && route.Auth.Username != "" {
+		log.Printf("[route:%s] auth:    required (user=%s)", route.Dialer, route.Auth.Username)
+	}
+	var ruleDescs []string
+	for name, rule := range route.Rules {
+		ruleDescs = append(ruleDescs, fmt.Sprintf("%s(p%d)", name, rule.GetPriority()))
+	}
+	sort.Strings(ruleDescs)
+	log.Printf("[route:%s] rules:   %s", route.Dialer, strings.Join(ruleDescs, ", "))
+
+	server.ListenAndServe()
 }
 
-func startServers(entries []ProxyEntry) *serverGroup {
-	g := &serverGroup{entries: entries}
-	for _, entry := range entries {
+// serverGroup управляет группой запущенных серверов (прокси + маршруты).
+type serverGroup struct {
+	stops []chan struct{}
+	wg    sync.WaitGroup
+}
+
+func startServers(active ActiveConfig) *serverGroup {
+	g := &serverGroup{}
+
+	// Строим карту именованных прокси для маршрутов
+	proxyMap := make(map[string]NamedProxy)
+	for _, p := range active.Proxies {
+		if p.Name == "" {
+			continue
+		}
+		d, err := buildDialer(p)
+		if err != nil {
+			log.Printf("[routes] failed to build dialer for proxy %q: %v", p.Name, err)
+			continue
+		}
+		proxyMap[p.Name] = NamedProxy{Entry: p, Dialer: d}
+	}
+
+	// Запускаем standalone-слушатели (прокси с dialer)
+	for _, p := range active.Proxies {
+		if p.Dialer == "" {
+			continue
+		}
 		stop := make(chan struct{})
 		g.stops = append(g.stops, stop)
 		g.wg.Add(1)
-		go runServer(entry, stop, &g.wg)
+		go runServer(p, stop, &g.wg)
 	}
+
+	// Запускаем маршруты
+	for _, r := range active.Routes {
+		stop := make(chan struct{})
+		g.stops = append(g.stops, stop)
+		g.wg.Add(1)
+		go runRouteServer(r, proxyMap, stop, &g.wg)
+	}
+
 	return g
 }
 
@@ -320,16 +591,24 @@ func (g *serverGroup) stopAll() {
 	g.wg.Wait()
 }
 
-func entriesChanged(a, b []ProxyEntry) bool {
-	if len(a) != len(b) {
+func configChanged(a, b ActiveConfig) bool {
+	if len(a.Proxies) != len(b.Proxies) || len(a.Routes) != len(b.Routes) {
 		return true
 	}
-	set := make(map[string]struct{}, len(a))
-	for _, e := range a {
-		set[e.configHash()] = struct{}{}
+	set := make(map[string]struct{}, len(a.Proxies)+len(a.Routes))
+	for i := range a.Proxies {
+		set["p:"+a.Proxies[i].configHash()] = struct{}{}
 	}
-	for _, e := range b {
-		if _, ok := set[e.configHash()]; !ok {
+	for i := range b.Proxies {
+		if _, ok := set["p:"+b.Proxies[i].configHash()]; !ok {
+			return true
+		}
+	}
+	for i := range a.Routes {
+		set["r:"+a.Routes[i].configHash()] = struct{}{}
+	}
+	for i := range b.Routes {
+		if _, ok := set["r:"+b.Routes[i].configHash()]; !ok {
 			return true
 		}
 	}
@@ -349,7 +628,7 @@ func watchConfigModify(watcher *fsnotify.Watcher, configFile string, notify chan
 					log.Println("config modified:", event.Name)
 					select {
 					case notify <- struct{}{}:
-					default: // уже есть ожидающее уведомление
+					default:
 					}
 				}
 			case err, ok := <-watcher.Errors:
@@ -368,12 +647,15 @@ func watchConfigModify(watcher *fsnotify.Watcher, configFile string, notify chan
 func main() {
 	configFile := getConfigFile()
 
-	entries := getActiveProxies(configFile)
-	if len(entries) == 0 {
-		log.Fatal("no active proxies in config")
+	active, err := getActiveConfig(configFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(active.Proxies) == 0 && len(active.Routes) == 0 {
+		log.Fatal("no active proxies or routes in config")
 	}
 
-	group := startServers(entries)
+	group := startServers(active)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGHUP)
@@ -405,16 +687,20 @@ func main() {
 			return
 
 		case <-modify:
-			next := getActiveProxies(configFile)
-			if len(next) == 0 {
-				log.Println("config reload: no active proxies, keeping current config")
+			next, err := getActiveConfig(configFile)
+			if err != nil {
+				log.Printf("config reload error: %v, keeping current config", err)
 				continue
 			}
-			if entriesChanged(entries, next) {
-				log.Printf("config changed: stopping %d server(s), starting %d", len(entries), len(next))
+			if len(next.Proxies) == 0 && len(next.Routes) == 0 {
+				log.Println("config reload: no active proxies or routes, keeping current config")
+				continue
+			}
+			if configChanged(active, next) {
+				log.Printf("config changed: restarting servers")
 				group.stopAll()
-				entries = next
-				group = startServers(entries)
+				active = next
+				group = startServers(active)
 			} else {
 				log.Println("config reloaded: no changes detected")
 			}
