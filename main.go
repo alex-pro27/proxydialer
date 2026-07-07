@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -28,6 +29,7 @@ type Protocol string
 
 const (
 	SOCKS5 Protocol = "socks5"
+	HTTP   Protocol = "http"
 )
 
 const defaultConfigFileName = "config.yaml"
@@ -42,7 +44,7 @@ type AuthConfig struct {
 type ProxyEntry struct {
 	Dialer   string     `yaml:"dialer"`           // локальный адрес слушателя, например 127.0.0.1:7492
 	Proxy    string     `yaml:"proxy"`            // адрес удалённого прокси, например 85.193.81.230:1818
-	Protocol Protocol   `yaml:"protocol"`         // только "socks5"
+	Protocol Protocol   `yaml:"protocol"`         // "socks5" или "http"
 	Username string     `yaml:"username,omitempty"` // плоский формат (старый)
 	Password string     `yaml:"password,omitempty"` // плоский формат (старый)
 	Auth     *AuthConfig `yaml:"auth,omitempty"`    // вложенный формат (новый)
@@ -126,6 +128,82 @@ type Config struct {
 type NamedProxy struct {
 	Entry  ProxyEntry
 	Dialer proxy.Dialer
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+type httpConnectDialer struct {
+	address    string
+	authHeader string
+	forward    proxy.Dialer
+}
+
+func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("http proxy only supports tcp, got %q", network)
+	}
+
+	forward := d.forward
+	if forward == nil {
+		forward = proxy.Direct
+	}
+
+	conn, err := forward.Dial("tcp", d.address)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if d.authHeader != "" {
+		if _, err := fmt.Fprintf(conn, "Proxy-Authorization: %s\r\n", d.authHeader); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	if _, err := io.WriteString(conn, "\r\n"); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		conn.Close()
+		msg := resp.Status
+		if bodyText := strings.TrimSpace(string(body)); bodyText != "" {
+			msg += ": " + bodyText
+		}
+		return nil, fmt.Errorf("http proxy connect failed: %s", msg)
+	}
+
+	if br.Buffered() > 0 {
+		return &bufferedConn{Conn: conn, reader: br}, nil
+	}
+	return conn, nil
+}
+
+func normalizeProtocol(protocol Protocol) Protocol {
+	return Protocol(strings.ToLower(strings.TrimSpace(string(protocol))))
+}
+
+func proxyScheme(protocol Protocol) string {
+	return string(normalizeProtocol(protocol))
 }
 
 // matchDomain проверяет, совпадает ли host с доменом.
@@ -219,8 +297,11 @@ func getActiveConfig(configFile string) (ActiveConfig, error) {
 		if !p.Use {
 			continue
 		}
-		if p.Protocol != SOCKS5 {
-			log.Printf("skip proxy %s: protocol %q not supported (only socks5)", p.Proxy, p.Protocol)
+		p.Protocol = normalizeProtocol(p.Protocol)
+		switch p.Protocol {
+		case SOCKS5, HTTP:
+		default:
+			log.Printf("skip proxy %s: protocol %q not supported (supported: socks5, http)", p.Proxy, p.Protocol)
 			continue
 		}
 		proxies = append(proxies, p)
@@ -432,13 +513,27 @@ func handleHTTP(w http.ResponseWriter, req *http.Request, d proxy.Dialer) {
 }
 
 func buildDialer(entry ProxyEntry) (proxy.Dialer, error) {
-	var auth *proxy.Auth
+	entry.Protocol = normalizeProtocol(entry.Protocol)
 	username := entry.GetUsername()
 	password := entry.GetPassword()
-	if username != "" || password != "" {
-		auth = &proxy.Auth{User: username, Password: password}
+
+	switch entry.Protocol {
+	case SOCKS5:
+		var auth *proxy.Auth
+		if username != "" || password != "" {
+			auth = &proxy.Auth{User: username, Password: password}
+		}
+		return proxy.SOCKS5("tcp", entry.Proxy, auth, proxy.Direct)
+	case HTTP:
+		authHeader := ""
+		if username != "" || password != "" {
+			token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+			authHeader = "Basic " + token
+		}
+		return &httpConnectDialer{address: entry.Proxy, authHeader: authHeader, forward: proxy.Direct}, nil
+	default:
+		return nil, fmt.Errorf("unsupported proxy protocol %q", entry.Protocol)
 	}
-	return proxy.SOCKS5("tcp", entry.Proxy, auth, proxy.Direct)
 }
 
 func runServer(entry ProxyEntry, stop <-chan struct{}, wg *sync.WaitGroup) {
@@ -474,7 +569,7 @@ func runServer(entry ProxyEntry, stop <-chan struct{}, wg *sync.WaitGroup) {
 		server.Shutdown(context.Background())
 	}()
 
-	log.Printf("[%s] listening → socks5://%s", entry.Dialer, entry.Proxy)
+	log.Printf("[%s] listening → %s://%s", entry.Dialer, proxyScheme(entry.Protocol), entry.Proxy)
 	if len(entry.Only) > 0 {
 		log.Printf("[%s] only:    %v", entry.Dialer, entry.Only)
 	}

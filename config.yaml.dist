@@ -43,7 +43,7 @@ proxies:
   -
     name: US (Microsoft, GitHub, OpenAI)
     proxy: 127.0.0.1:6066
-    protocol: socks5
+    protocol: http
     use: true
     only:
       - '*.microsoft.com'

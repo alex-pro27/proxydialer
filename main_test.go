@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -615,6 +617,114 @@ routes:
 	r := conf.Routes[0]
 	if r.Rules["SPB"].GetPriority() != 10 {
 		t.Errorf("priority should be 10 (priority > pririty), got %d", r.Rules["SPB"].GetPriority())
+	}
+}
+
+func TestGetActiveConfigSupportsHTTPProxy(t *testing.T) {
+	yaml := `
+version: "1"
+proxies:
+  - dialer: 127.0.0.1:7492
+    proxy: 127.0.0.1:8080
+    protocol: http
+    use: true
+  - dialer: 127.0.0.1:7493
+    proxy: 127.0.0.1:1080
+    protocol: socks5
+    use: true
+  - dialer: 127.0.0.1:7494
+    proxy: 127.0.0.1:3128
+    protocol: https
+    use: true
+`
+	tmp, err := os.CreateTemp("", "proxydialer-active-config-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(yaml); err != nil {
+		tmp.Close()
+		t.Fatal(err)
+	}
+	if err := tmp.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := getActiveConfig(tmp.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active.Proxies) != 2 {
+		t.Fatalf("expected 2 supported proxies, got %d", len(active.Proxies))
+	}
+	if active.Proxies[0].Protocol != HTTP {
+		t.Errorf("first protocol = %q, want %q", active.Proxies[0].Protocol, HTTP)
+	}
+	if active.Proxies[1].Protocol != SOCKS5 {
+		t.Errorf("second protocol = %q, want %q", active.Proxies[1].Protocol, SOCKS5)
+	}
+}
+
+func TestBuildDialerHTTPConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer conn.Close()
+
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer req.Body.Close()
+
+		if req.Method != http.MethodConnect {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		if req.Host != "example.com:443" {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+		if got := req.Header.Get("Proxy-Authorization"); got != "Basic dXNlcjpwYXNz" {
+			errCh <- io.ErrUnexpectedEOF
+			return
+		}
+
+		_, err = io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n")
+		errCh <- err
+	}()
+
+	d, err := buildDialer(ProxyEntry{Proxy: ln.Addr().String(), Protocol: HTTP, Username: "user", Password: "pass"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := d.Dial("tcp", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildDialerUnsupportedProtocol(t *testing.T) {
+	_, err := buildDialer(ProxyEntry{Proxy: "127.0.0.1:8080", Protocol: "https"})
+	if err == nil {
+		t.Fatal("expected error for unsupported protocol")
 	}
 }
 
