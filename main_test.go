@@ -6,8 +6,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -51,6 +53,24 @@ func TestMatchDomain(t *testing.T) {
 		{"*example.com", "example.com", false},
 		// IP адреса
 		{"10.248.1.79", "10.248.1.79", true},
+		// CIDR IPv4
+		{"91.108.4.25", "91.108.4.0/22", true},
+		{"91.108.7.255", "91.108.4.0/22", true},
+		{"91.108.8.1", "91.108.4.0/22", false},
+		{"149.154.169.200", "149.154.168.0/22", true},
+		{"149.154.172.1", "149.154.168.0/22", false},
+		{"95.161.79.255", "95.161.64.0/20", true},
+		{"95.161.80.1", "95.161.64.0/20", false},
+		// CIDR IPv6
+		{"2001:67c:4e8:1234::1", "2001:67c:4e8::/48", true},
+		{"2001:67c:4e9::1", "2001:67c:4e8::/48", false},
+		{"2001:b28:f23d::1234", "2001:b28:f23d::/48", true},
+		{"2001:b28:f23e::1", "2001:b28:f23d::/48", false},
+		// CIDR — не IP в качестве host
+		{"example.com", "91.108.4.0/22", false},
+		// невалидный CIDR — проваливается в обычное сравнение
+		{"example.com/path", "example.com/path", true},
+		{"example.com/path", "other.com/path", false},
 		// пробелы
 		{"  example.com  ", "example.com", true},
 	}
@@ -91,6 +111,12 @@ func TestShouldUseProxy(t *testing.T) {
 		{"only‑match‑port", "api.openai.com:443", []string{"*.openai.com"}, nil, true, "only:*.openai.com"},
 		// exclude с портом
 		{"exclude‑match‑port", "yandex.ru:443", nil, []string{"*.yandex.ru"}, false, "exclude:*.yandex.ru"},
+		// CIDR в only
+		{"only‑cidr‑match", "91.108.4.25", []string{"91.108.4.0/22"}, nil, true, "only:91.108.4.0/22"},
+		{"only‑cidr‑no‑match", "91.108.8.1", []string{"91.108.4.0/22"}, nil, false, "not-in-only"},
+		// CIDR в exclude
+		{"exclude‑cidr‑match", "2001:67c:4e8::1", nil, []string{"2001:67c:4e8::/48"}, false, "exclude:2001:67c:4e8::/48"},
+		{"exclude‑cidr‑no‑match", "2001:67c:4e9::1", nil, []string{"2001:67c:4e8::/48"}, true, "default"},
 	}
 
 	for _, tt := range tests {
@@ -266,7 +292,241 @@ func TestRouteRequestDefaultPriorityConflict(t *testing.T) {
 	}
 }
 
-// --------------- parseBasicAuth ---------------
+// --------------- hybridListener ---------------
+
+func TestHybridListenerDispatch(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	socksCh := make(chan struct{}, 1)
+	hl := &hybridListener{
+		Listener: ln,
+		handleSOCKS5: func(c net.Conn) {
+			c.Close()
+			socksCh <- struct{}{}
+		},
+	}
+
+	httpCh := make(chan net.Conn, 1)
+	go func() {
+		c, err := hl.Accept()
+		if err != nil {
+			return
+		}
+		httpCh <- c
+	}()
+
+	// SOCKS5-соединение (первый байт 0x05)
+	sc, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-socksCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for SOCKS5 handler")
+	}
+
+	// HTTP-соединение
+	hc, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hc.Close()
+	if _, err := hc.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-httpCh:
+		c.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for HTTP connection")
+	}
+}
+
+// --------------- serveSOCKS5 ---------------
+
+func TestServeSOCKS5Connect(t *testing.T) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+
+	echoDone := make(chan struct{})
+	go func() {
+		c, err := echoLn.Accept()
+		if err != nil {
+			close(echoDone)
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(c, buf); err != nil {
+			close(echoDone)
+			return
+		}
+		c.Write(buf)
+		close(echoDone)
+	}()
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go serveSOCKS5(server, nil, "test", func(host string) (proxy.Dialer, string) {
+		return proxy.Direct, "default"
+	})
+
+	// Greeting: 0x05, 1 метод, no-auth
+	if _, err := client.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	greetingResp := make([]byte, 2)
+	if _, err := io.ReadFull(client, greetingResp); err != nil {
+		t.Fatal(err)
+	}
+	if greetingResp[0] != 0x05 || greetingResp[1] != 0x00 {
+		t.Fatalf("unexpected method selection %v", greetingResp)
+	}
+
+	// CONNECT-запрос к echo-серверу
+	host, portStr, err := net.SplitHostPort(echoLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		t.Fatalf("expected IPv4, got %q", host)
+	}
+	req := []byte{0x05, socks5CmdConnect, 0x00, socks5AtypIPv4}
+	req = append(req, ip...)
+	req = append(req, byte(port>>8), byte(port&0xff))
+	if _, err := client.Write(req); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply[1] != socks5RepSuccess {
+		t.Fatalf("CONNECT failed: rep=%d", reply[1])
+	}
+
+	// Туннель: данные проходят до echo и обратно
+	payload := []byte("hello")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("relay = %q, want %q", got, payload)
+	}
+
+	<-echoDone
+}
+
+func TestServeSOCKS5RejectsAuthRequiredClient(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go serveSOCKS5(server, nil, "test", func(host string) (proxy.Dialer, string) {
+		return proxy.Direct, "default"
+	})
+
+	// Клиент требует только user/pass — сервер без auth его не поддерживает
+	if _, err := client.Write([]byte{0x05, 0x01, socks5MethodUserPass}); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(client, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp[1] != socks5MethodNoAcceptable {
+		t.Fatalf("expected method no-acceptable, got %d", resp[1])
+	}
+}
+
+func TestServeSOCKS5UserPassAuth(t *testing.T) {
+	auth := &AuthConfig{Username: "user", Password: "pass"}
+
+	// Успешная авторизация
+	t.Run("success", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		go serveSOCKS5(server, auth, "test", func(host string) (proxy.Dialer, string) {
+			return proxy.Direct, "default"
+		})
+
+		// Greeting с user/pass методом
+		if _, err := client.Write([]byte{0x05, 0x01, socks5MethodUserPass}); err != nil {
+			t.Fatal(err)
+		}
+		sel := make([]byte, 2)
+		if _, err := io.ReadFull(client, sel); err != nil {
+			t.Fatal(err)
+		}
+		if sel[0] != 0x05 || sel[1] != socks5MethodUserPass {
+			t.Fatalf("expected user/pass method selection, got %v", sel)
+		}
+
+		// user/pass: 0x01, ulen=4 "user", plen=4 "pass"
+		if _, err := client.Write([]byte{0x01, 0x04, 'u', 's', 'e', 'r', 0x04, 'p', 'a', 's', 's'}); err != nil {
+			t.Fatal(err)
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(client, authResp); err != nil {
+			t.Fatal(err)
+		}
+		if authResp[1] != 0x00 {
+			t.Fatalf("expected auth success, got %v", authResp)
+		}
+	})
+
+	// Неверный пароль
+	t.Run("wrong password", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		go serveSOCKS5(server, auth, "test", func(host string) (proxy.Dialer, string) {
+			return proxy.Direct, "default"
+		})
+
+		if _, err := client.Write([]byte{0x05, 0x01, socks5MethodUserPass}); err != nil {
+			t.Fatal(err)
+		}
+		sel := make([]byte, 2)
+		if _, err := io.ReadFull(client, sel); err != nil {
+			t.Fatal(err)
+		}
+
+		// user=user, pass=wrong
+		if _, err := client.Write([]byte{0x01, 0x04, 'u', 's', 'e', 'r', 0x05, 'w', 'r', 'o', 'n', 'g'}); err != nil {
+			t.Fatal(err)
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(client, authResp); err != nil {
+			t.Fatal(err)
+		}
+		if authResp[1] != 0x01 {
+			t.Fatalf("expected auth failure (0x01), got %v", authResp)
+		}
+	})
+}
+
+
 
 func TestParseBasicAuth(t *testing.T) {
 	tests := []struct {

@@ -1,11 +1,17 @@
 module proxydialer
 
-go 1.25.0
-
-require golang.org/x/net v0.56.0
+go 1.25.5
 
 require (
-	github.com/fsnotify/fsnotify v1.10.1 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	github.com/fsnotify/fsnotify v1.10.1
+	github.com/v2fly/v2ray-core/v5 v5.53.0
+	golang.org/x/net v0.56.0
+	google.golang.org/protobuf v1.36.12
+	gopkg.in/yaml.v3 v3.0.1
+)
+
+require (
+	github.com/adrg/xdg v0.5.3 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 )
