@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/v2fly/v2ray-core/v5/app/router/routercommon"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -137,29 +138,85 @@ type geoSnapshot struct {
 
 var geoStore atomic.Value // хранит *geoSnapshot
 
-// loadGeoData скачивает (при необходимости) и загружает базы geoip/geosite.
-func loadGeoData(cfg *GeoDataConfig) error {
+// collectGeoRefs собирает имена списков geosite:/geoip:, упомянутых в правилах
+// only/exclude всех прокси и маршрутов.
+func collectGeoRefs(proxies []ProxyEntry, routes []RouteEntry) (geoSite, geoIP map[string]bool) {
+	geoSite = make(map[string]bool)
+	geoIP = make(map[string]bool)
+	add := func(entries []string) {
+		for _, e := range entries {
+			switch {
+			case strings.HasPrefix(e, "geosite:"):
+				if name := strings.ToLower(strings.TrimSpace(e[len("geosite:"):])); name != "" {
+					geoSite[name] = true
+				}
+			case strings.HasPrefix(e, "geoip:"):
+				if name := strings.ToLower(strings.TrimSpace(e[len("geoip:"):])); name != "" {
+					geoIP[name] = true
+				}
+			}
+		}
+	}
+	for i := range proxies {
+		add(proxies[i].Only)
+		add(proxies[i].Exclude)
+	}
+	for i := range routes {
+		add(routes[i].Only)
+		add(routes[i].Exclude)
+	}
+	return geoSite, geoIP
+}
+
+func setEqual(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// loadGeoData скачивает (при необходимости) и загружает только те списки geoip/geosite,
+// которые реально упомянуты в конфиге. Если geo-правил нет — ничего не качает.
+func loadGeoData(cfg *GeoDataConfig, geoSiteWanted, geoIPWanted map[string]bool) error {
+	sites := map[string]*geoSiteMatcher{}
+	ips := map[string]*geoIPMatcher{}
+
+	if len(geoSiteWanted) == 0 && len(geoIPWanted) == 0 {
+		geoStore.Store(&geoSnapshot{sites: sites, ips: ips})
+		log.Println("geodata: no geosite/geoip rules in config, skipping load")
+		return nil
+	}
+
 	dir := cfg.dir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	sitePath := filepath.Join(dir, "dlc.dat")
-	ipPath := filepath.Join(dir, "geoip.dat")
 
-	if err := ensureGeoFile(sitePath, cfg.geoSiteURL()); err != nil {
-		return err
-	}
-	if err := ensureGeoFile(ipPath, cfg.geoIPURL()); err != nil {
-		return err
+	if len(geoSiteWanted) > 0 {
+		sitePath := filepath.Join(dir, "dlc.dat")
+		if err := ensureGeoFile(sitePath, cfg.geoSiteURL()); err != nil {
+			return err
+		}
+		var err error
+		if sites, err = loadGeoSites(sitePath, geoSiteWanted); err != nil {
+			return err
+		}
 	}
 
-	sites, err := loadGeoSites(sitePath)
-	if err != nil {
-		return err
-	}
-	ips, err := loadGeoIPs(ipPath)
-	if err != nil {
-		return err
+	if len(geoIPWanted) > 0 {
+		ipPath := filepath.Join(dir, "geoip.dat")
+		if err := ensureGeoFile(ipPath, cfg.geoIPURL()); err != nil {
+			return err
+		}
+		var err error
+		if ips, err = loadGeoIPs(ipPath, geoIPWanted); err != nil {
+			return err
+		}
 	}
 
 	geoStore.Store(&geoSnapshot{sites: sites, ips: ips})
@@ -225,22 +282,52 @@ func writeGeoSource(path, url string) error {
 	return os.WriteFile(geoSourcePath(path), []byte(url+"\n"), 0o644)
 }
 
-// loadGeoSites разбирает dlc.dat (GeoSiteList) в map[name]*geoSiteMatcher.
-func loadGeoSites(path string) (map[string]*geoSiteMatcher, error) {
+// forEachEntry вызывает fn для каждой length-delimited записи (field 1) в protobuf.
+// Позволяет разбирать .dat потоково, не удерживая весь список в памяти.
+func forEachEntry(data []byte, fn func(entry []byte) error) error {
+	for len(data) > 0 {
+		num, typ, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return fmt.Errorf("invalid protobuf tag")
+		}
+		data = data[n:]
+		if num == 1 && typ == protowire.BytesType {
+			v, n := protowire.ConsumeBytes(data)
+			if n < 0 {
+				return fmt.Errorf("invalid protobuf bytes")
+			}
+			data = data[n:]
+			if err := fn(v); err != nil {
+				return err
+			}
+		} else {
+			n := protowire.ConsumeFieldValue(num, typ, data)
+			if n < 0 {
+				return fmt.Errorf("invalid protobuf field")
+			}
+			data = data[n:]
+		}
+	}
+	return nil
+}
+
+// loadGeoSites разбирает dlc.dat (GeoSiteList) в map[name]*geoSiteMatcher,
+// загружая только списки из wanted.
+func loadGeoSites(path string, wanted map[string]bool) (map[string]*geoSiteMatcher, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var list routercommon.GeoSiteList
-	if err := proto.Unmarshal(data, &list); err != nil {
-		return nil, fmt.Errorf("parse geosite %s: %w", path, err)
-	}
 
 	sites := make(map[string]*geoSiteMatcher)
-	for _, e := range list.GetEntry() {
+	err = forEachEntry(data, func(entry []byte) error {
+		var e routercommon.GeoSite
+		if err := proto.Unmarshal(entry, &e); err != nil {
+			return fmt.Errorf("parse geosite %s: %w", path, err)
+		}
 		name := geoEntryName(e.GetCountryCode(), e.GetCode())
-		if name == "" {
-			continue
+		if name == "" || !wanted[name] {
+			return nil
 		}
 		m := &geoSiteMatcher{}
 		for _, d := range e.GetDomain() {
@@ -261,26 +348,31 @@ func loadGeoSites(path string) (map[string]*geoSiteMatcher, error) {
 			m.rules = append(m.rules, rule)
 		}
 		sites[name] = m
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return sites, nil
 }
 
-// loadGeoIPs разбирает geoip.dat (GeoIPList) в map[name]*geoIPMatcher.
-func loadGeoIPs(path string) (map[string]*geoIPMatcher, error) {
+// loadGeoIPs разбирает geoip.dat (GeoIPList) в map[name]*geoIPMatcher,
+// загружая только списки из wanted.
+func loadGeoIPs(path string, wanted map[string]bool) (map[string]*geoIPMatcher, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var list routercommon.GeoIPList
-	if err := proto.Unmarshal(data, &list); err != nil {
-		return nil, fmt.Errorf("parse geoip %s: %w", path, err)
-	}
 
 	ips := make(map[string]*geoIPMatcher)
-	for _, e := range list.GetEntry() {
+	err = forEachEntry(data, func(entry []byte) error {
+		var e routercommon.GeoIP
+		if err := proto.Unmarshal(entry, &e); err != nil {
+			return fmt.Errorf("parse geoip %s: %w", path, err)
+		}
 		name := geoEntryName(e.GetCountryCode(), e.GetCode())
-		if name == "" {
-			continue
+		if name == "" || !wanted[name] {
+			return nil
 		}
 		m := &geoIPMatcher{inverse: e.GetInverseMatch()}
 		for _, c := range e.GetCidr() {
@@ -289,6 +381,10 @@ func loadGeoIPs(path string) (map[string]*geoIPMatcher, error) {
 			}
 		}
 		ips[name] = m
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return ips, nil
 }

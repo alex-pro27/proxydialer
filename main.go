@@ -1025,7 +1025,8 @@ func main() {
 		log.Fatal("no active proxies or routes in config")
 	}
 
-	if err := loadGeoData(active.Geodata); err != nil {
+	siteWanted, ipWanted := collectGeoRefs(active.Proxies, active.Routes)
+	if err := loadGeoData(active.Geodata, siteWanted, ipWanted); err != nil {
 		log.Printf("geodata load error: %v (geosite:/geoip: rules will not match)", err)
 	}
 
@@ -1070,9 +1071,13 @@ func main() {
 				log.Println("config reload: no active proxies or routes, keeping current config")
 				continue
 			}
-			if !geodataSame(active.Geodata, next.Geodata) {
+			nextSiteWanted, nextIPWanted := collectGeoRefs(next.Proxies, next.Routes)
+			curSiteWanted, curIPWanted := collectGeoRefs(active.Proxies, active.Routes)
+			if !geodataSame(active.Geodata, next.Geodata) ||
+				!setEqual(nextSiteWanted, curSiteWanted) ||
+				!setEqual(nextIPWanted, curIPWanted) {
 				log.Println("geodata config changed: reloading geodata")
-				if err := loadGeoData(next.Geodata); err != nil {
+				if err := loadGeoData(next.Geodata, nextSiteWanted, nextIPWanted); err != nil {
 					log.Printf("geodata reload error: %v, keeping previous data", err)
 				} else {
 					active.Geodata = next.Geodata

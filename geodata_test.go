@@ -123,7 +123,7 @@ func TestLoadGeoSites(t *testing.T) {
 	}
 	path := writeProto(t, "geosite-test-*.dat", list)
 
-	sites, err := loadGeoSites(path)
+	sites, err := loadGeoSites(path, map[string]bool{"telegram": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestLoadGeoIPs(t *testing.T) {
 	}
 	path := writeProto(t, "geoip-test-*.dat", list)
 
-	ips, err := loadGeoIPs(path)
+	ips, err := loadGeoIPs(path, map[string]bool{"telegram": true, "private-except": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,6 +192,90 @@ func TestLoadGeoIPs(t *testing.T) {
 	}
 	if !inv.match(net.ParseIP("8.8.8.8")) {
 		t.Error("inverse list should match out-of-range IP")
+	}
+}
+
+func TestLoadGeoIPsSelective(t *testing.T) {
+	list := &routercommon.GeoIPList{
+		Entry: []*routercommon.GeoIP{
+			{CountryCode: "telegram", Cidr: []*routercommon.CIDR{{Ip: net.ParseIP("91.108.4.0").To4(), Prefix: 22}}},
+			{CountryCode: "google", Cidr: []*routercommon.CIDR{{Ip: net.ParseIP("8.8.8.0").To4(), Prefix: 24}}},
+		},
+	}
+	path := writeProto(t, "geoip-sel-*.dat", list)
+
+	ips, err := loadGeoIPs(path, map[string]bool{"telegram": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ips["telegram"]; !ok {
+		t.Error("telegram should be loaded")
+	}
+	if _, ok := ips["google"]; ok {
+		t.Error("google should NOT be loaded (not in wanted)")
+	}
+}
+
+func TestLoadGeoSitesSelective(t *testing.T) {
+	list := &routercommon.GeoSiteList{
+		Entry: []*routercommon.GeoSite{
+			{CountryCode: "telegram", Domain: []*routercommon.Domain{{Type: routercommon.Domain_RootDomain, Value: "t.me"}}},
+			{CountryCode: "google", Domain: []*routercommon.Domain{{Type: routercommon.Domain_RootDomain, Value: "google.com"}}},
+		},
+	}
+	path := writeProto(t, "geosite-sel-*.dat", list)
+
+	sites, err := loadGeoSites(path, map[string]bool{"telegram": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := sites["telegram"]; !ok {
+		t.Error("telegram should be loaded")
+	}
+	if _, ok := sites["google"]; ok {
+		t.Error("google should NOT be loaded (not in wanted)")
+	}
+}
+
+func TestCollectGeoRefs(t *testing.T) {
+	proxies := []ProxyEntry{
+		{Only: []string{"geosite:telegram", "geoip:telegram"}, Exclude: []string{"*.example.com"}},
+	}
+	routes := []RouteEntry{
+		{Exclude: []string{"geoip:google", "geosite: GOOGLE"}},
+	}
+
+	gs, gi := collectGeoRefs(proxies, routes)
+	if !gs["telegram"] || !gs["google"] {
+		t.Errorf("geosite refs = %v, want telegram+google", gs)
+	}
+	if !gi["telegram"] || !gi["google"] {
+		t.Errorf("geoip refs = %v, want telegram+google", gi)
+	}
+	if len(gs) != 2 || len(gi) != 2 {
+		t.Errorf("unexpected refs: geosite=%v geoip=%v", gs, gi)
+	}
+}
+
+func TestLoadGeoDataSkipWhenEmpty(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &GeoDataConfig{Dir: dir}
+
+	if err := loadGeoData(cfg, map[string]bool{}, map[string]bool{}); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, _ := geoStore.Load().(*geoSnapshot)
+	if snap == nil || len(snap.sites) != 0 || len(snap.ips) != 0 {
+		t.Fatal("expected empty snapshot")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no files downloaded, got %d", len(entries))
 	}
 }
 
