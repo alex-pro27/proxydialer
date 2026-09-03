@@ -128,9 +128,22 @@ type Config struct {
 
 // NamedProxy связывает запись прокси с собранным dialer-ом для использования в маршрутах.
 type NamedProxy struct {
-	Entry  ProxyEntry
-	Dialer proxy.Dialer
+	Entry    ProxyEntry
+	Dialer   proxy.Dialer
+	UDPAssoc udpFactory
 }
+
+// upstream объединяет TCP-диалер и фабрику UDP-ассоциаций для одного направления.
+type upstream struct {
+	tcp proxy.Dialer
+	udp udpFactory
+	key string
+}
+
+func (u upstream) isDirect() bool { return u.tcp == proxy.Direct }
+
+// directUpstream — прямое соединение без прокси.
+var directUpstream = upstream{tcp: proxy.Direct, udp: newDirectAssoc, key: "direct"}
 
 type bufferedConn struct {
 	net.Conn
@@ -354,12 +367,12 @@ func copyHeader(dst, src http.Header) {
 	}
 }
 
-// dialerFor возвращает нужный dialer в зависимости от правил фильтрации.
-func dialerFor(host string, proxyD proxy.Dialer, entry ProxyEntry) (proxy.Dialer, string) {
+// dialerFor возвращает нужный upstream в зависимости от правил фильтрации.
+func dialerFor(host string, proxyUp upstream, entry ProxyEntry) (upstream, string) {
 	if use, reason := shouldUseProxy(host, entry); use {
-		return proxyD, reason
+		return proxyUp, reason
 	} else {
-		return proxy.Direct, reason
+		return directUpstream, reason
 	}
 }
 
@@ -369,7 +382,7 @@ func dialerFor(host string, proxyD proxy.Dialer, entry ProxyEntry) (proxy.Dialer
 //  2. Поиск only-совпадений среди прокси: домен в Only прокси → приоритет only-совпадений выше
 //  3. Если only-совпадений нет — fallback на прокси, которые не исключают домен
 //  4. Ни один прокси не совпал → Direct
-func routeRequest(host string, route RouteEntry, proxies map[string]NamedProxy) (proxy.Dialer, string) {
+func routeRequest(host string, route RouteEntry, proxies map[string]NamedProxy) (upstream, string) {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
@@ -377,7 +390,7 @@ func routeRequest(host string, route RouteEntry, proxies map[string]NamedProxy) 
 	// 1. Пре-фильтр маршрута
 	routeFilter := ProxyEntry{Exclude: route.Exclude, Only: route.Only}
 	if use, reason := shouldUseProxy(host, routeFilter); !use {
-		return proxy.Direct, "route-" + reason
+		return directUpstream, "route-" + reason
 	}
 
 	// 2. Сортировка правил по приоритету (меньше число = выше приоритет)
@@ -421,17 +434,19 @@ func routeRequest(host string, route RouteEntry, proxies map[string]NamedProxy) 
 	// 4. Only-совпадения приоритетнее exclude/default
 	if len(onlyMatches) > 0 {
 		winner := onlyMatches[0] // уже отсортированы по приоритету
-		return proxies[winner.name].Dialer, "route-only:" + winner.name + "(" + winner.reason + ")"
+		np := proxies[winner.name]
+		return upstream{tcp: np.Dialer, udp: np.UDPAssoc, key: np.Entry.Proxy}, "route-only:" + winner.name + "(" + winner.reason + ")"
 	}
 
 	// 5. Fallback на exclude/default
 	if len(defaultMatches) > 0 {
 		winner := defaultMatches[0]
-		return proxies[winner.name].Dialer, "route-default:" + winner.name + "(" + winner.reason + ")"
+		np := proxies[winner.name]
+		return upstream{tcp: np.Dialer, udp: np.UDPAssoc, key: np.Entry.Proxy}, "route-default:" + winner.name + "(" + winner.reason + ")"
 	}
 
 	// 6. Ничего не совпало
-	return proxy.Direct, "route-no-match"
+	return directUpstream, "route-no-match"
 }
 
 // parseBasicAuth разбирает заголовок формата "Basic <base64>"
@@ -527,7 +542,7 @@ func handleHTTP(w http.ResponseWriter, req *http.Request, d proxy.Dialer) {
 	io.Copy(w, resp.Body)
 }
 
-func buildDialer(entry ProxyEntry) (proxy.Dialer, error) {
+func buildDialer(entry ProxyEntry) (upstream, error) {
 	entry.Protocol = normalizeProtocol(entry.Protocol)
 	username := entry.GetUsername()
 	password := entry.GetPassword()
@@ -538,16 +553,28 @@ func buildDialer(entry ProxyEntry) (proxy.Dialer, error) {
 		if username != "" || password != "" {
 			auth = &proxy.Auth{User: username, Password: password}
 		}
-		return proxy.SOCKS5("tcp", entry.Proxy, auth, proxy.Direct)
+		d, err := proxy.SOCKS5("tcp", entry.Proxy, auth, proxy.Direct)
+		if err != nil {
+			return upstream{}, err
+		}
+		return upstream{
+			tcp: d,
+			udp: func() (udpAssoc, error) { return newSocks5Assoc(entry.Proxy, auth) },
+			key: entry.Proxy,
+		}, nil
 	case HTTP:
 		authHeader := ""
 		if username != "" || password != "" {
 			token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 			authHeader = "Basic " + token
 		}
-		return &httpConnectDialer{address: entry.Proxy, authHeader: authHeader, forward: proxy.Direct}, nil
+		return upstream{
+			tcp: &httpConnectDialer{address: entry.Proxy, authHeader: authHeader, forward: proxy.Direct},
+			udp: nil,
+			key: entry.Proxy,
+		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported proxy protocol %q", entry.Protocol)
+		return upstream{}, fmt.Errorf("unsupported proxy protocol %q", entry.Protocol)
 	}
 }
 
@@ -588,7 +615,7 @@ func sendSOCKS5Reply(conn net.Conn, rep byte) {
 
 // serveSOCKS5 обслуживает одно SOCKS5-соединение: CONNECT-туннель через dialer,
 // выбранный функцией dialFor. Если auth задан — требует username/password.
-func serveSOCKS5(conn net.Conn, auth *AuthConfig, label string, dialFor func(host string) (proxy.Dialer, string)) {
+func serveSOCKS5(conn net.Conn, auth *AuthConfig, label string, dialFor func(host string) (upstream, string)) {
 	relayed := false
 	defer func() {
 		if !relayed {
@@ -695,19 +722,40 @@ func serveSOCKS5(conn net.Conn, auth *AuthConfig, label string, dialFor func(hos
 	}
 	port := int(portBytes[0])<<8 | int(portBytes[1])
 
-	if cmd != socks5CmdConnect {
+	if cmd != socks5CmdConnect && cmd != socks5CmdUDPAssociate {
 		sendSOCKS5Reply(conn, socks5RepCommandNotSupported)
+		return
+	}
+
+	if cmd == socks5CmdUDPAssociate {
+		localIP := net.IP{127, 0, 0, 1}
+		if ta, ok := conn.LocalAddr().(*net.TCPAddr); ok && ta.IP != nil && !ta.IP.IsUnspecified() {
+			localIP = ta.IP
+		}
+		relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: localIP, Port: 0})
+		if err != nil {
+			sendSOCKS5Reply(conn, socks5RepGeneralFailure)
+			return
+		}
+		relayAddr := relay.LocalAddr().(*net.UDPAddr)
+		if err := writeUDPAssociateReply(conn, relayAddr); err != nil {
+			relay.Close()
+			return
+		}
+		log.Printf("[%s:socks5] %s UDP ASSOCIATE → relay %s", label, conn.RemoteAddr(), relayAddr)
+		relayed = true
+		serveUDPAssociate(conn, relay, dialFor, label)
 		return
 	}
 
 	d, reason := dialFor(host)
 	via := "proxy"
-	if d == proxy.Direct {
+	if d.isDirect() {
 		via = "direct"
 	}
 	log.Printf("[%s:socks5] %s CONNECT %s → %s (%s)", label, conn.RemoteAddr(), host, via, reason)
 
-	dest, err := d.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	dest, err := d.tcp.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		sendSOCKS5Reply(conn, socks5RepConnectionRefused)
 		return
@@ -784,7 +832,7 @@ func (l *hybridListener) Accept() (net.Conn, error) {
 func runServer(entry ProxyEntry, stop <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	proxyDialer, err := buildDialer(entry)
+	proxyUp, err := buildDialer(entry)
 	if err != nil {
 		log.Printf("[%s] failed to create dialer: %v", entry.Dialer, err)
 		return
@@ -793,17 +841,17 @@ func runServer(entry ProxyEntry, stop <-chan struct{}, wg *sync.WaitGroup) {
 	server := &http.Server{
 		Addr: entry.Dialer,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			d, reason := dialerFor(r.Host, proxyDialer, entry)
+			d, reason := dialerFor(r.Host, proxyUp, entry)
 			via := "proxy"
-			if d == proxy.Direct {
+			if d.isDirect() {
 				via = "direct"
 			}
 			log.Printf("[%s] %s %s %s → %s (%s)", entry.Dialer, r.RemoteAddr, r.Method, r.Host, via, reason)
 
 			if r.Method == http.MethodConnect {
-				handleTunneling(w, r, d)
+				handleTunneling(w, r, d.tcp)
 			} else {
-				handleHTTP(w, r, d)
+				handleHTTP(w, r, d.tcp)
 			}
 		}),
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
@@ -818,8 +866,8 @@ func runServer(entry ProxyEntry, stop <-chan struct{}, wg *sync.WaitGroup) {
 	hl := &hybridListener{
 		Listener: ln,
 		handleSOCKS5: func(c net.Conn) {
-			serveSOCKS5(c, nil, entry.Dialer, func(host string) (proxy.Dialer, string) {
-				return dialerFor(host, proxyDialer, entry)
+			serveSOCKS5(c, nil, entry.Dialer, func(host string) (upstream, string) {
+				return dialerFor(host, proxyUp, entry)
 			})
 		},
 	}
@@ -855,15 +903,15 @@ func runRouteServer(route RouteEntry, proxyMap map[string]NamedProxy, stop <-cha
 
 			d, reason := routeRequest(r.Host, route, proxyMap)
 			via := "proxy"
-			if d == proxy.Direct {
+			if d.isDirect() {
 				via = "direct"
 			}
 			log.Printf("[route:%s] %s %s %s → %s (%s)", route.Dialer, r.RemoteAddr, r.Method, r.Host, via, reason)
 
 			if r.Method == http.MethodConnect {
-				handleTunneling(w, r, d)
+				handleTunneling(w, r, d.tcp)
 			} else {
-				handleHTTP(w, r, d)
+				handleHTTP(w, r, d.tcp)
 			}
 		}),
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
@@ -878,7 +926,7 @@ func runRouteServer(route RouteEntry, proxyMap map[string]NamedProxy, stop <-cha
 	hl := &hybridListener{
 		Listener: ln,
 		handleSOCKS5: func(c net.Conn) {
-			serveSOCKS5(c, route.Auth, route.Dialer, func(host string) (proxy.Dialer, string) {
+			serveSOCKS5(c, route.Auth, route.Dialer, func(host string) (upstream, string) {
 				return routeRequest(host, route, proxyMap)
 			})
 		},
@@ -929,7 +977,7 @@ func startServers(active ActiveConfig) *serverGroup {
 			log.Printf("[routes] failed to build dialer for proxy %q: %v", p.Name, err)
 			continue
 		}
-		proxyMap[p.Name] = NamedProxy{Entry: p, Dialer: d}
+		proxyMap[p.Name] = NamedProxy{Entry: p, Dialer: d.tcp, UDPAssoc: d.udp}
 	}
 
 	// Запускаем standalone-слушатели (прокси с dialer)

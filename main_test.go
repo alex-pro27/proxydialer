@@ -182,18 +182,18 @@ func TestRouteRequest(t *testing.T) {
 			}
 			switch tt.wantDialer {
 			case "direct":
-				if d != proxy.Direct {
-					t.Errorf("expected proxy.Direct, got %v", d)
+				if d.tcp != proxy.Direct {
+					t.Errorf("expected proxy.Direct, got %v", d.tcp)
 				}
 			case "spb":
-				td, ok := d.(testDialer)
+				td, ok := d.tcp.(testDialer)
 				if !ok || td.name != "spb" {
-					t.Errorf("expected spb dialer, got %v", d)
+					t.Errorf("expected spb dialer, got %v", d.tcp)
 				}
 			case "us":
-				td, ok := d.(testDialer)
+				td, ok := d.tcp.(testDialer)
 				if !ok || td.name != "us" {
-					t.Errorf("expected us dialer, got %v", d)
+					t.Errorf("expected us dialer, got %v", d.tcp)
 				}
 			}
 		})
@@ -217,13 +217,13 @@ func TestRouteRequestOnlyPreFilter(t *testing.T) {
 
 	// Домен в only маршрута — проходит
 	d, _ := routeRequest("example.com", route, proxyMap)
-	if d == proxy.Direct {
+	if d.tcp == proxy.Direct {
 		t.Error("example.com should pass route only‑filter")
 	}
 
 	// Домен НЕ в only маршрута — Direct
 	d, _ = routeRequest("other.com", route, proxyMap)
-	if d != proxy.Direct {
+	if d.tcp != proxy.Direct {
 		t.Error("other.com should be blocked by route only‑filter")
 	}
 }
@@ -257,9 +257,9 @@ func TestRouteRequestOnlyPriorityConflict(t *testing.T) {
 	if !strings.HasPrefix(reason, "route-only:") {
 		t.Errorf("expected route-only reason, got %q", reason)
 	}
-	td, ok := d.(testDialer)
+	td, ok := d.tcp.(testDialer)
 	if !ok || td.name != "high" {
-		t.Errorf("expected high‑priority dialer, got %v", d)
+		t.Errorf("expected high‑priority dialer, got %v", d.tcp)
 	}
 }
 
@@ -286,9 +286,9 @@ func TestRouteRequestDefaultPriorityConflict(t *testing.T) {
 	if !strings.HasPrefix(reason, "route-default:") {
 		t.Errorf("expected route-default reason, got %q", reason)
 	}
-	td, ok := d.(testDialer)
+	td, ok := d.tcp.(testDialer)
 	if !ok || td.name != "high" {
-		t.Errorf("expected high‑priority dialer, got %v", d)
+		t.Errorf("expected high‑priority dialer, got %v", d.tcp)
 	}
 }
 
@@ -379,8 +379,8 @@ func TestServeSOCKS5Connect(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 
-	go serveSOCKS5(server, nil, "test", func(host string) (proxy.Dialer, string) {
-		return proxy.Direct, "default"
+	go serveSOCKS5(server, nil, "test", func(host string) (upstream, string) {
+		return directUpstream, "default"
 	})
 
 	// Greeting: 0x05, 1 метод, no-auth
@@ -443,8 +443,8 @@ func TestServeSOCKS5RejectsAuthRequiredClient(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 
-	go serveSOCKS5(server, nil, "test", func(host string) (proxy.Dialer, string) {
-		return proxy.Direct, "default"
+	go serveSOCKS5(server, nil, "test", func(host string) (upstream, string) {
+		return directUpstream, "default"
 	})
 
 	// Клиент требует только user/pass — сервер без auth его не поддерживает
@@ -467,8 +467,8 @@ func TestServeSOCKS5UserPassAuth(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		client, server := net.Pipe()
 		defer client.Close()
-		go serveSOCKS5(server, auth, "test", func(host string) (proxy.Dialer, string) {
-			return proxy.Direct, "default"
+		go serveSOCKS5(server, auth, "test", func(host string) (upstream, string) {
+			return directUpstream, "default"
 		})
 
 		// Greeting с user/pass методом
@@ -500,8 +500,8 @@ func TestServeSOCKS5UserPassAuth(t *testing.T) {
 	t.Run("wrong password", func(t *testing.T) {
 		client, server := net.Pipe()
 		defer client.Close()
-		go serveSOCKS5(server, auth, "test", func(host string) (proxy.Dialer, string) {
-			return proxy.Direct, "default"
+		go serveSOCKS5(server, auth, "test", func(host string) (upstream, string) {
+			return directUpstream, "default"
 		})
 
 		if _, err := client.Write([]byte{0x05, 0x01, socks5MethodUserPass}); err != nil {
@@ -970,7 +970,7 @@ func TestBuildDialerHTTPConnect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn, err := d.Dial("tcp", "example.com:443")
+	conn, err := d.tcp.Dial("tcp", "example.com:443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1047,7 +1047,7 @@ func TestRouteRequestProxyWithBothOnlyExclude(t *testing.T) {
 
 	// api.openai.com — в only и не в exclude → проходит
 	d, reason := routeRequest("api.openai.com", route, proxyMap)
-	if d == proxy.Direct {
+	if d.tcp == proxy.Direct {
 		t.Error("api.openai.com should route through proxy")
 	}
 	if !strings.HasPrefix(reason, "route-only:") {
@@ -1056,7 +1056,7 @@ func TestRouteRequestProxyWithBothOnlyExclude(t *testing.T) {
 
 	// mail.openai.com — в only и в exclude → Direct
 	d, reason = routeRequest("mail.openai.com", route, proxyMap)
-	if d != proxy.Direct {
+	if d.tcp != proxy.Direct {
 		t.Error("mail.openai.com should be direct (only+exclude)")
 	}
 	if !strings.HasPrefix(reason, "route-no-match") {
@@ -1084,9 +1084,9 @@ func TestRouteRequestMissingProxy(t *testing.T) {
 	if !strings.HasPrefix(reason, "route-default:") {
 		t.Errorf("reason = %q, want route-default (missing proxy skipped, SPB used)", reason)
 	}
-	td, ok := d.(testDialer)
+	td, ok := d.tcp.(testDialer)
 	if !ok || td.name != "spb" {
-		t.Errorf("expected spb dialer after skipping missing proxy, got %v", d)
+		t.Errorf("expected spb dialer after skipping missing proxy, got %v", d.tcp)
 	}
 }
 
@@ -1101,7 +1101,7 @@ func TestRouteRequestDisabledProxyInMap(t *testing.T) {
 	}
 
 	d, reason := routeRequest("example.com", route, nil)
-	if d != proxy.Direct {
+	if d.tcp != proxy.Direct {
 		t.Error("expected Direct when proxyMap is nil")
 	}
 	if !strings.HasPrefix(reason, "route-no-match") {
@@ -1109,7 +1109,7 @@ func TestRouteRequestDisabledProxyInMap(t *testing.T) {
 	}
 
 	d, reason = routeRequest("example.com", route, map[string]NamedProxy{})
-	if d != proxy.Direct {
+	if d.tcp != proxy.Direct {
 		t.Error("expected Direct when proxyMap is empty")
 	}
 	if !strings.HasPrefix(reason, "route-no-match") {
